@@ -46,10 +46,23 @@ ENV NODE_ENV=production
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
+    file \
+    git \
+    build-essential \
     tini \
     python3 \
     python3-venv \
   && rm -rf /var/lib/apt/lists/*
+
+# Install Homebrew for skill/tool compatibility in Railway deployments.
+RUN NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+  && /home/linuxbrew/.linuxbrew/bin/brew --version
+
+ENV HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew
+ENV HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar
+ENV HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew
+ENV HOMEBREW_NO_AUTO_UPDATE=1
 
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
@@ -61,7 +74,7 @@ ENV NPM_CONFIG_PREFIX=/data/npm
 ENV NPM_CONFIG_CACHE=/data/npm-cache
 ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
-ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/data/npm/bin:/data/pnpm:${PATH}"
 
 WORKDIR /app
 
