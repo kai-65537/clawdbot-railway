@@ -50,14 +50,23 @@ RUN apt-get update \
     file \
     git \
     build-essential \
+    procps \
     tini \
     python3 \
     python3-venv \
   && rm -rf /var/lib/apt/lists/*
 
 # Install Homebrew for skill/tool compatibility in Railway deployments.
-RUN NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+# Homebrew must be installed as a non-root user on Linux.
+RUN mkdir -p /home/linuxbrew \
+  && chown -R node:node /home/linuxbrew
+
+USER node
+RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
   && /home/linuxbrew/.linuxbrew/bin/brew --version
+
+USER root
+RUN ln -sf /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew
 
 ENV HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew
 ENV HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar
@@ -74,6 +83,7 @@ ENV NPM_CONFIG_PREFIX=/data/npm
 ENV NPM_CONFIG_CACHE=/data/npm-cache
 ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
+ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
 ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/data/npm/bin:/data/pnpm:${PATH}"
 
 WORKDIR /app
