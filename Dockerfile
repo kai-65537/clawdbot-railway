@@ -1,155 +1,89 @@
-FROM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935
+# Build openclaw from source to avoid npm packaging gaps (some dist files are not shipped).
+FROM node:22-bookworm AS openclaw-build
 
-# OCI base-image metadata for downstream image consumers.
-# If you change these annotations, also update:
-# - docs/install/docker.md ("Base image metadata" section)
-# - https://docs.openclaw.ai/install/docker
-LABEL org.opencontainers.image.base.name="docker.io/library/node:22-bookworm" \
-  org.opencontainers.image.base.digest="sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935" \
-  org.opencontainers.image.source="https://github.com/openclaw/openclaw" \
-  org.opencontainers.image.url="https://openclaw.ai" \
-  org.opencontainers.image.documentation="https://docs.openclaw.ai/install/docker" \
-  org.opencontainers.image.licenses="MIT" \
-  org.opencontainers.image.title="OpenClaw" \
-  org.opencontainers.image.description="OpenClaw gateway and CLI runtime container image"
+# Dependencies needed for openclaw build
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    curl \
+    python3 \
+    make \
+    g++ \
+  && rm -rf /var/lib/apt/lists/*
 
-# Install Bun (required for build scripts)
+# Install Bun (openclaw build uses it)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
 RUN corepack enable
 
-WORKDIR /app
-RUN chown node:node /app
+WORKDIR /openclaw
 
-ARG OPENCLAW_DOCKER_APT_PACKAGES=""
-RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES && \
-      apt-get clean && \
-      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    fi
+# Pin to a known-good ref (tag/branch). Override in Railway template settings if needed.
+# Using a released tag avoids build breakage when `main` temporarily references unpublished packages.
+ARG OPENCLAW_GIT_REF=v2026.2.9
+RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
 
-COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-COPY --chown=node:node ui/package.json ./ui/package.json
-COPY --chown=node:node patches ./patches
-COPY --chown=node:node scripts ./scripts
+# Patch: relax version requirements for packages that may reference unpublished versions.
+# Apply to all extension package.json files to handle workspace protocol (workspace:*).
+RUN set -eux; \
+  find ./extensions -name 'package.json' -type f | while read -r f; do \
+    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
+    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
+  done
 
-USER node
-# Reduce OOM risk on low-memory hosts during dependency installation.
-# Docker builds on small VMs may otherwise fail with "Killed" (exit 137).
-RUN NODE_OPTIONS=--max-old-space-size=2048 pnpm install --frozen-lockfile
-
-# Optionally install Chromium and Xvfb for browser automation.
-# Build with: docker build --build-arg OPENCLAW_INSTALL_BROWSER=1 ...
-# Adds ~300MB but eliminates the 60-90s Playwright install on every container start.
-# Must run after pnpm install so playwright-core is available in node_modules.
-USER root
-ARG OPENCLAW_INSTALL_BROWSER=""
-RUN if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb && \
-      mkdir -p /home/node/.cache/ms-playwright && \
-      PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright \
-      node /app/node_modules/playwright-core/cli.js install --with-deps chromium && \
-      chown -R node:node /home/node/.cache/ms-playwright && \
-      apt-get clean && \
-      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    fi
-
-# Optionally install Docker CLI for sandbox container management.
-# Build with: docker build --build-arg OPENCLAW_INSTALL_DOCKER_CLI=1 ...
-# Adds ~50MB. Only the CLI is installed — no Docker daemon.
-# Required for agents.defaults.sandbox to function in Docker deployments.
-ARG OPENCLAW_INSTALL_DOCKER_CLI=""
-ARG OPENCLAW_DOCKER_GPG_FINGERPRINT="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
-RUN if [ -n "$OPENCLAW_INSTALL_DOCKER_CLI" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg && \
-      install -m 0755 -d /etc/apt/keyrings && \
-      # Verify Docker apt signing key fingerprint before trusting it as a root key.
-      # Update OPENCLAW_DOCKER_GPG_FINGERPRINT when Docker rotates release keys.
-      curl -fsSL https://download.docker.com/linux/debian/gpg -o /tmp/docker.gpg.asc && \
-      expected_fingerprint="$(printf '%s' "$OPENCLAW_DOCKER_GPG_FINGERPRINT" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')" && \
-      actual_fingerprint="$(gpg --batch --show-keys --with-colons /tmp/docker.gpg.asc | awk -F: '$1 == \"fpr\" { print toupper($10); exit }')" && \
-      if [ -z "$actual_fingerprint" ] || [ "$actual_fingerprint" != "$expected_fingerprint" ]; then \
-        echo "ERROR: Docker apt key fingerprint mismatch (expected $expected_fingerprint, got ${actual_fingerprint:-<empty>})" >&2; \
-        exit 1; \
-      fi && \
-      gpg --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker.gpg.asc && \
-      rm -f /tmp/docker.gpg.asc && \
-      chmod a+r /etc/apt/keyrings/docker.gpg && \
-      printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable\n' \
-        "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.list && \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        docker-ce-cli docker-compose-plugin && \
-      apt-get clean && \
-      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    fi
-
-# Optional: Install Linuxbrew for skill dependency management.
-# Build with: docker build --build-arg OPENCLAW_INSTALL_BREW=1 ...
-# Adds ~500MB but enables brew-based skill installation (uv, go, signal-cli, etc.)
-ARG OPENCLAW_INSTALL_BREW=""
-RUN if [ -n "$OPENCLAW_INSTALL_BREW" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential curl file git procps && \
-      if ! id -u linuxbrew >/dev/null 2>&1; then useradd -m -s /bin/bash linuxbrew; fi && \
-      mkdir -p /home/linuxbrew/.linuxbrew && \
-      chown -R linuxbrew:linuxbrew /home/linuxbrew && \
-      su - linuxbrew -c "NONINTERACTIVE=1 CI=1 /bin/bash -c '$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)'" && \
-      if [ ! -e /home/linuxbrew/.linuxbrew/Library ]; then ln -s /home/linuxbrew/.linuxbrew/Homebrew/Library /home/linuxbrew/.linuxbrew/Library; fi && \
-      if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then echo "brew install failed"; exit 1; fi && \
-      chown -R node:node /home/linuxbrew/.linuxbrew && \
-      apt-get clean && \
-      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    fi
-ENV HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew
-ENV HOMEBREW_CELLAR=/home/linuxbrew/.linuxbrew/Cellar
-ENV HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew
-ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
-
-USER node
-COPY --chown=node:node . .
-# Normalize copied plugin/agent paths so plugin safety checks do not reject
-# world-writable directories inherited from source file modes.
-RUN for dir in /app/extensions /app/.agent /app/.agents; do \
-      if [ -d "$dir" ]; then \
-        find "$dir" -type d -exec chmod 755 {} +; \
-        find "$dir" -type f -exec chmod 644 {} +; \
-      fi; \
-    done
+RUN pnpm install --no-frozen-lockfile
 RUN pnpm build
-# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:build
+RUN pnpm ui:install && pnpm ui:build
 
-# Expose the CLI binary without requiring npm global writes as non-root.
-USER root
-RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
- && chmod 755 /app/openclaw.mjs
 
+# Runtime image
+FROM node:22-bookworm
 ENV NODE_ENV=production
 
-# Security hardening: Run as non-root user
-# The node:22-bookworm image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
-USER node
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tini \
+    python3 \
+    python3-venv \
+  && rm -rf /var/lib/apt/lists/*
 
-# Start gateway server with default config.
-# Binds to loopback (127.0.0.1) by default for security.
-#
-# IMPORTANT: With Docker bridge networking (-p 18789:18789), loopback bind
-# makes the gateway unreachable from the host. Either:
-#   - Use --network host, OR
-#   - Override --bind to "lan" (0.0.0.0) and set auth credentials
-#
-# Built-in probe endpoints for container health checks:
-#   - GET /healthz (liveness) and GET /readyz (readiness)
-#   - aliases: /health and /ready
-# For external access from host/ingress, override bind to "lan" and set auth.
-HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
+# `openclaw update` expects pnpm. Provide it in the runtime image.
+RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
+
+# Persist user-installed tools by default by targeting the Railway volume.
+# - npm global installs -> /data/npm
+# - pnpm global installs -> /data/pnpm (binaries) + /data/pnpm-store (store)
+ENV NPM_CONFIG_PREFIX=/data/npm
+ENV NPM_CONFIG_CACHE=/data/npm-cache
+ENV PNPM_HOME=/data/pnpm
+ENV PNPM_STORE_DIR=/data/pnpm-store
+ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
+
+WORKDIR /app
+
+# Wrapper deps
+COPY package.json ./
+RUN npm install --omit=dev && npm cache clean --force
+
+# Copy built openclaw
+COPY --from=openclaw-build /openclaw /openclaw
+
+# Provide an openclaw executable
+RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"' > /usr/local/bin/openclaw \
+  && chmod +x /usr/local/bin/openclaw
+
+COPY src ./src
+
+# The wrapper listens on $PORT.
+# IMPORTANT: Do not set a default PORT here.
+# Railway injects PORT at runtime and routes traffic to that port.
+# If we force a different port, deployments can come up but the domain will route elsewhere.
+EXPOSE 8080
+
+# Ensure PID 1 reaps zombies and forwards signals.
+ENTRYPOINT ["tini", "--"]
+CMD ["node", "src/server.js"]
